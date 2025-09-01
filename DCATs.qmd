@@ -1,0 +1,731 @@
+---
+title: "DCATS_pericytes_dcats"
+author: "Miguel Blanco"
+format: html
+editor: visual
+---
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(DCATS)
+```
+
+## DCATS
+
+DCATS can only be performed on 2 classes, as we have seen that "Healthy" and "Non_Inflamed" are very similar, we will treat do it with Healthy and Inflamed
+
+```{r}
+base_dir = "/home/projects/dtu_00062/people/migchi/Pericytes/HealthyVs/"
+
+pericytes_dcats <- readRDS("/home/projects/dtu_00062/people/migchi/pericytes/HealthyVs/pericytes_healthyVs.rds")
+pericytes_dcats <- readRDS(file.path(base_dir, "Pericytes_healthyVs.rds"))
+pericytes_dcats <- JoinLayers(pericytes_dcats)
+
+
+
+
+#pericytes_dcats@meta.data <- pericytes_dcats@meta.data |> 
+  #mutate(study_case = ifelse(study_case == "Non_inflamed_CD", "Healthy_CRC", study_case))
+
+#OR
+
+pericytes_dcats <- subset(pericytes_dcats, subset = study_case != "Non_inflamed_CD")
+```
+
+```{r}
+unique(pericytes_dcats$study_case)
+```
+
+```{r}
+
+pericytes_dcats <- FindNeighbors(pericytes_dcats, reduction = "harmony.integrated", dims = 1:25, verbose = FALSE)
+
+
+pericytes_dcats <- FindClusters(pericytes_dcats, resolution = 0.05, cluster.name = "harmony.clusters.0.05", verbose = FALSE )
+pericytes_dcats <- FindClusters(pericytes_dcats, resolution = 0.1, cluster.name = "harmony.clusters.0.1", verbose = FALSE )
+pericytes_dcats <- FindClusters(pericytes_dcats, resolution = 0.15, cluster.name = "harmony.clusters.0.15", verbose = FALSE )
+pericytes_dcats <- FindClusters(pericytes_dcats, resolution = 0.3, cluster.name = "harmony.clusters.0.3", verbose = FALSE )
+pericytes_dcats <- FindClusters(pericytes_dcats, resolution = 0.5, cluster.name = "harmony.clusters.0.5", verbose = FALSE )
+
+p0 <- DimPlot(pericytes_dcats, reduction = "harmony_UMAP",  group.by = "harmony.clusters.0.05", label = T)
+p1 <- DimPlot(pericytes_dcats, reduction = "harmony_UMAP",  group.by = "harmony.clusters.0.1", label = T)
+p2 <- DimPlot(pericytes_dcats, reduction = "harmony_UMAP",  group.by = "harmony.clusters.0.15", label = T)
+p3 <- DimPlot(pericytes_dcats, reduction = "harmony_UMAP",  group.by = "harmony.clusters.0.3", label = T)
+
+
+p <- wrap_plots(p0, p1, p2, p3, ncol = 2, nrow = 2, byrow = F)
+
+ggsave("DCATS/clust_res_UMAP.png", plot = p, width = 15, height = 9, dpi = 400)
+p
+```
+
+```{r}
+tree <- clustree(pericytes_dcats, prefix = "harmony.clusters.")
+tree
+
+
+
+
+ggsave(
+  filename = "DCATS/clustree.png",
+  plot = tree,
+  width = 12, height = 10, dpi = 300, bg = "white"
+)
+```
+
+#### Tryout: Personalize clusters
+
+```{r}
+
+##WITH NON INFLAMED
+
+#pericytes_dcats@meta.data <- pericytes_dcats@meta.data |> 
+ # dplyr::mutate(harmony.clusters.personalized = 
+  #                case_when(harmony.clusters.0.15 == "4" ~ "0",
+   #                         harmony.clusters.0.15 == "8" ~ "3",
+    #                        harmony.clusters.0.15 == "7" ~ "6",
+     #                       TRUE ~ harmony.clusters.0.15))
+
+
+
+pericytes_dcats@meta.data <- pericytes_dcats@meta.data |> 
+  dplyr::mutate(harmony.clusters.personalized = 
+                   case_when(harmony.clusters.0.15 == "4" ~ "0",
+                            harmony.clusters.0.15 == "8" ~ "1",
+                            harmony.clusters.0.15 == "7" ~ "6",
+                            TRUE ~ harmony.clusters.0.15))
+
+clust_final <- DimPlot(pericytes_dcats, reduction = "harmony_UMAP", group.by = "harmony.clusters.personalized", label = T) + labs(title = "Clusterized Pericytes")
+
+clust_final_splitted <- DimPlot(pericytes_dcats, reduction = "harmony_UMAP", group.by = "harmony.clusters.personalized", split.by = "study_case", label = T)
+
+cell_counts <- pericytes_dcats@meta.data |>
+  dplyr::count(study_case) |>
+  mutate(label = paste0("n = ", n))
+
+# 3. Manually define coordinates for the labels (adjust if needed)
+cell_counts$x <- -5    # X position (centered)
+cell_counts$y <- 6    # Y position (above the UMAP clusters)
+
+# 4. Add the text annotations to the base plot
+clust_final_splitted <- clust_final_splitted +
+  geom_text(
+    data = cell_counts,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    size = 4,
+    fontface = "bold")+
+  labs(title = "Clusterized Pericytes by Condition")
+
+
+clust_final
+clust_final_splitted
+
+
+
+ggsave(filename = "DCATS/clust_final.png", plot = clust_final,width = 12, height = 10, dpi = 300, bg = "white")
+
+ggsave(filename = "DCATS/clust_final_splitted.png", plot = clust_final_splitted,width = 12, height = 10, dpi = 300, bg = "white")
+```
+
+```{r}
+pericytes_dcats@meta.data |>
+  dplyr::count(study_case)
+```
+
+```{r}
+simMat <- knn_simMat(pericytes_dcats@graphs$RNA_snn, pericytes_dcats$harmony.clusters.personalized)
+count_DCAT <- table(pericytes_dcats$Patient_studycase, pericytes_dcats$harmony.clusters.personalized)
+
+samples_names <- rownames(count_DCAT)
+
+design <- ifelse(grepl("inflamed", samples_names), "Inflamed", "Healthy")
+
+
+design <- data.frame(study_case = design)
+
+dcats <- dcats_GLM(count_mat = count_DCAT,
+                   design_mat = design,
+                   similarity_mat = simMat)
+
+dcats
+```
+
+```{r}
+# per-sample proportions by cluster
+prop_by_sample <- prop.table(count_DCAT, 1)
+summary(prop_by_sample[, "2"])  # e.g., cluster 2
+
+
+
+
+# visualize variability
+boxplot(as.numeric(prop_by_sample[, "2"]) ~ design$study_case,
+        ylab="Proportion of cluster 2", xlab="Group")
+```
+
+```{r}
+df_prop <- as.data.frame(as.table(prop_by_sample)) |> 
+  dplyr::rename(Sample = Var1, Cluster = Var2, Proportion = Freq)|>
+  mutate(Condition = ifelse(grepl("inflamed", Sample, ignore.case = TRUE),
+                           "Inflamed", "Healthy")) |> 
+  mutate(Condition = ifelse(grepl("Non_inflamed", Sample, ignore.case = T),
+                            "Non Inflamed", Condition))
+
+
+
+
+plot_cluster_bar <- function(data, cluster_id) {
+  library(ggplot2)
+  ggplot(subset(data, Cluster == cluster_id),
+         aes(x = Sample, y = Proportion, fill = Condition)) +
+    geom_col() +
+    coord_flip() +
+    labs(
+      title = paste("Proportion of cluster", cluster_id, "per patient"),
+      x = "Patient", y = "Proportion"
+    ) +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+    scale_fill_manual(
+      values = c(
+        "Non Inflamed" = "#0072B2",  # blue
+        "Inflamed"     = "#D55E00",  # red-orange
+        "Healthy"      = "#009E73"   # green
+      )
+    )
+}
+
+
+clust3_barplot <- plot_cluster_bar(df_prop, "3")
+clust2_barplot <- plot_cluster_bar(df_prop, "2")
+clust1_barplot <- plot_cluster_bar(df_prop, "1")
+clust0_barplot <- plot_cluster_bar(df_prop, "0")
+
+
+
+
+
+
+
+clust0_barplot
+clust1_barplot
+clust2_barplot
+clust3_barplot
+
+ggsave(file = "DCATS/With_NonInf/cluster_1_barplot.png", plot =clust1_barplot, width = 12, height = 10, dpi = 300, bg = "white")
+ggsave(file = "DCATS/With_NonInf/cluster_2_barplot.png", plot =clust2_barplot, width = 12, height = 10, dpi = 300, bg = "white")
+ggsave(file = "DCATS/With_NonInf/cluster_0_barplot.png", plot =clust0_barplot, width = 12, height = 10, dpi = 300, bg = "white")
+ggsave(file = "DCATS/With_NonInf/cluster_3_barplot.png", plot =clust3_barplot, width = 12, height = 10, dpi = 300, bg = "white")
+```
+
+### 4.1 All markers
+
+Now that we know which clusters are overexpressed, let's use FindAllMarkers function to discover the gene signatures of those clusters
+
+```{r}
+ClusterMarkers <- FindAllMarkers(object = pericytes_dcats,
+    assay = "RNA",
+    min.pct = 0.25,
+    logfc.threshold = 0.25) 
+```
+
+```{r}
+ClusterMarkers3 <- ClusterMarkers |> 
+  filter(cluster == "3")
+
+ClusterMarkers0 <- ClusterMarkers |> 
+  filter(cluster == "0")
+
+ClusterMarkers2 <- ClusterMarkers |> 
+  filter(cluster == "2")
+
+ClusterMarkers1 <- ClusterMarkers |> 
+  filter(cluster == "1")
+```
+
+```{r}
+ClusterMarkers2 |> 
+  arrange(desc(abs(avg_log2FC))) |> 
+  head(5)
+```
+
+### 4.2 Contractile Vs Non contractile
+
+```         
+```
+
+```{r}
+contractile_Markers2 <- ClusterMarkers2 |> 
+  filter(gene %in% contractile_genes)
+
+non_contractile_markers2 <- ClusterMarkers2 |> 
+  filter(gene %in% non_contractile_genes)
+```
+
+```{r}
+contractile_Markers <- ClusterMarkers |> 
+  filter(gene %in% contractile_genes)
+
+non_contractile_markers <- ClusterMarkers |> 
+  filter(gene %in% non_contractile_genes)
+```
+
+### 4.2 DCATS FGSEA
+
+```{r}
+ClusterMarkers1 <- ClusterMarkers1 |> 
+  mutate(p_val = ifelse(p_val == 0, 2.225074e-308, p_val)) |> 
+  mutate(ranked_score = -log10(p_val) * sign(avg_log2FC))
+
+ClusterMarkers2 <- ClusterMarkers2 |>
+  mutate(p_val = ifelse(p_val == 0, 2.225074e-308, p_val)) |> 
+  mutate(ranked_score = -log10(p_val) * sign(avg_log2FC))
+
+ClusterMarkers3 <- ClusterMarkers3 |> 
+  mutate(p_val = ifelse(p_val == 0, 2.225074e-308, p_val)) |> 
+  mutate(ranked_score = -log10(p_val) * sign(avg_log2FC))
+
+
+rankedscore_c6 <- ClusterMarkers1$ranked_score 
+names(rankedscore_c6) <- ClusterMarkers1$gene
+rankedscore_c6 <- sort(rankedscore_c6, decreasing = T)
+
+
+rankedscore_c2 <- ClusterMarkers2$ranked_score  
+names(rankedscore_c2) <- ClusterMarkers2$gene
+rankedscore_c2 <- sort(rankedscore_c2, decreasing = T)
+
+rankedscore_c4 <- ClusterMarkers3$ranked_score
+names(rankedscore_c4) <- ClusterMarkers3$gene
+rankedscore_c4 <- sort(rankedscore_c4, decreasing = T)
+
+```
+
+```{r}
+
+kegg_msigdb <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "BP")
+
+rctome_pathways1 <- reactomePathways(names(rankedscore_c6))
+rctome_pathways2 <- reactomePathways(names(rankedscore_c2))
+rctome_pathways3 <- reactomePathways(names(rankedscore_c4))
+```
+
+```{r}
+fgsea_cluster1 <- fgsea(pathways = rctome_pathways, stats = rankedscore_c6)
+fgsea_cluster2 <- fgsea(pathways = rctome_pathways, stats = rankedscore_c2)
+fgsea_cluster3 <- fgsea(pathways = rctome_pathways, stats = rankedscore_c4)
+
+
+```
+
+```{r}
+##6##
+fgsea_tidy <- fgsea_cluster1 |> 
+  as_tibble() 
+
+top20NES_6 <- fgsea_tidy |> 
+  arrange(desc(abs(NES))) |> 
+  head(20)
+
+top10NES <- fgsea_tidy |> 
+  arrange(desc(NES)) |> 
+  head(10)
+
+bot10NES <- fgsea_tidy |> 
+  arrange(NES) |> 
+  head(10)
+
+topbot10_6 <- rbind(top10NES, bot10NES)
+
+
+##2##
+
+fgsea_tidy <- fgsea_cluster2 |> 
+  as_tibble() 
+
+top20NES_2 <- fgsea_tidy |> 
+  arrange(desc(abs(NES))) |> 
+  head(20)
+
+top10NES <- fgsea_tidy |> 
+  arrange(desc(NES)) |> 
+  head(10)
+
+bot10NES <- fgsea_tidy |> 
+  arrange(NES) |> 
+  head(10)
+
+topbot10_2 <- rbind(top10NES, bot10NES)
+
+##4##
+
+fgsea_tidy <- fgsea_cluster3 |> 
+  as_tibble() 
+
+top20NES_4 <- fgsea_tidy |> 
+  arrange(desc(abs(NES))) |> 
+  head(20)
+
+top10NES <- fgsea_tidy |> 
+  arrange(desc(NES)) |> 
+  head(10)
+
+bot10NES <- fgsea_tidy |> 
+  arrange(NES) |> 
+  head(10)
+
+topbot10_4 <- rbind(top10NES, bot10NES)
+```
+
+```{r}
+fgsea_plot_6<- ggplot(top20NES_6, mapping = aes(x = NES, 
+                               y = reorder(pathway, NES)))+
+  geom_col(aes(fill = padj < 0.05))+
+  scale_fill_manual(values = c("TRUE" = "#2E8B57", "FALSE"= "salmon"))+
+  labs(title = "Top 10 most upregulated and downregulated KEGG Pathways in Cluster 6 (Overexpressed in Inflamed)",
+       x = "Pathway",
+       y = "NES",
+       fill = "Significant (padj < 0.05)")+
+  theme_minimal()+
+  theme(axis.title = element_text(size = 10, face = "bold"),
+        axis.text = element_text(size = 8),
+        plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+        legend.title = element_text(size = 8, face = "bold"))
+
+fgsea_plot_2 <- ggplot(topbot10_2, mapping = aes(x = NES, 
+                               y = reorder(pathway, NES)))+
+  geom_col(aes(fill = padj < 0.05))+
+  scale_fill_manual(values = c("TRUE" = "#2E8B57", "FALSE"= "salmon"))+
+  labs(title = "Top 10 most upregulated and downregulated KEGG Pathways in Cluster 2 (Underexpressed in Inflamed",
+       x = "Pathway",
+       y = "NES",
+       fill = "Significant (padj < 0.05)")+
+  theme_minimal()+
+  theme(axis.title = element_text(size = 10, face = "bold"),
+        axis.text = element_text(size = 8),
+        plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+        legend.title = element_text(size = 8, face = "bold"))
+
+fgsea_plot_4 <- ggplot(top20NES_4, mapping = aes(x = NES, 
+                               y = reorder(pathway, NES)))+
+  geom_col(aes(fill = padj < 0.05))+
+  scale_fill_manual(values = c("TRUE" = "#2E8B57", "FALSE"= "salmon"))+
+  labs(title = "Top 10 most upregulated and downregulated KEGG Pathways in Cluster 4 (Overexpressed in Inflamed)",
+       x = "Pathway",
+       y = "NES",
+       fill = "Significant (padj < 0.05)")+
+  theme_minimal()+
+  theme(axis.title = element_text(size = 10, face = "bold"),
+        axis.text = element_text(size = 8),
+        plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+        legend.title = element_text(size = 8, face = "bold"))
+```
+
+```{r}
+fgsea_plot_6
+fgsea_plot_2
+fgsea_plot_4
+```
+
+```{r}
+fgsea_tidy <- fgsea_cluster0_test |> 
+  as_tibble() 
+
+top10NES <- fgsea_cluster0_test |> 
+  arrange(desc(NES)) |> 
+  head(10)
+
+bot10NES <- fgsea_cluster0_test |> 
+  arrange(NES) |> 
+  head(10)
+
+topbot10 <- rbind(top10NES, bot10NES)
+```
+
+```{r}
+ggsave(filename = "HealthyVs//fgsea/fgsea_cluster1_top20.png", plot = fgsea_plot_6, width = 14, height = 10, dpi = 400 )
+ggsave(filename = "HealthyVs//fgsea/fgsea_cluster2_topbot10.png", plot = fgsea_plot_2, width = 20, height = 10, dpi = 400 )
+ggsave(filename = "HealthyVs//fgsea/fgsea_cluster3_top20.png", plot = fgsea_plot_4, width = 14, height = 10, dpi = 400 )
+```
+
+### 4.3 DCATS Volcano
+
+```{r}
+topCluster2 <- head(ClusterMarkers2 |> arrange(desc(abs(avg_log2FC))), 10)
+topCluster4 <- head(ClusterMarkers3 |> arrange(desc(abs(avg_log2FC))), 10)
+topCluster6 <- head(ClusterMarkers1 |> arrange(desc(abs(avg_log2FC))), 10)
+
+
+
+Volcano_Cluster2 <- ggplot(ClusterMarkers2, aes(x = avg_log2FC, y = -log10(p_val_adj))) +
+  geom_point(aes(color = p_val_adj < 0.05 & abs(avg_log2FC) > 1), alpha = 0.6) +
+  scale_color_manual(values = c("FALSE" = "blue", "TRUE" = "red"),
+                     name = "Significant") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey") +
+  geom_text_repel(data = topCluster2,
+                  aes(label = gene),
+                  size = 3.5, max.overlaps = Inf,
+                  segment.color = "black",
+                  segment.size = 0.3,
+                  arrow = arrow(length = unit(0.2, "npc"))) +
+  labs(title = "Volcano Plot Cluster 2 (Underexpressed in Inflamed)", x = "Log2 Fold Change", y = "-log10 adjusted p-value") +
+  theme_minimal()+
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+Volcano_Cluster4 <- ggplot(ClusterMarkers3, aes(x = avg_log2FC, y = -log10(p_val_adj))) +
+  geom_point(aes(color = p_val_adj < 0.05 & abs(avg_log2FC) > 1), alpha = 0.6) +
+  scale_color_manual(values = c("FALSE" = "blue", "TRUE" = "red"),
+                     name = "Significant") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey") +
+  geom_text_repel(data = topCluster4,
+                  aes(label = gene),
+                  size = 3.5, max.overlaps = Inf,
+                  segment.color = "black",
+                  segment.size = 0.3,
+                  arrow = arrow(length = unit(0.2, "npc"))) +
+  labs(title = "Volcano Plot Cluster 3 (Overexpressed in Inflamed)", x = "Log2 Fold Change", y = "-log10 adjusted p-value") +
+  theme_minimal()+
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+
+Volcano_Cluster6 <- ggplot(ClusterMarkers1, aes(x = avg_log2FC, y = -log10(p_val_adj))) +
+  geom_point(aes(color = p_val_adj < 0.05 & abs(avg_log2FC) > 1), alpha = 0.6) +
+  scale_color_manual(values = c("FALSE" = "blue", "TRUE" = "red"),
+                     name = "Significant") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey") +
+  geom_text_repel(data = topCluster6,
+                  aes(label = gene),
+                  size = 3.5, max.overlaps = Inf,
+                  segment.color = "black",
+                  segment.size = 0.3,
+                  arrow = arrow(length = unit(0.2, "npc"))) +
+  labs(title = "Volcano Plot Cluster 1 (Overexpressed in Inflamed)", x = "Log2 Fold Change", y = "-log10 adjusted p-value") +
+  theme_minimal()+
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+Volcano_Cluster2
+Volcano_Cluster4
+Volcano_Cluster6
+```
+
+```{r}
+ggsave(plot =Volcano_Cluster2, filename =  "HealthyVs/Volcano_Cluster2.png", width = 14, height = 10, dpi = 400 )
+ggsave(plot =Volcano_Cluster4, filename =  "HealthyVs/Volcano_Cluster4.png", width = 14, height = 10, dpi = 400 )
+ggsave(plot =Volcano_Cluster6, filename =  "HealthyVs/Volcano_Cluster6.png", width = 14, height = 10, dpi = 400 )
+```
+
+### 4.4 Look for specific genes
+
+```{r, warning=FALSE}
+VlnPlot(pericytes_dcats, features = c("VCAM1", "ICAM1"), group.by = "harmony.clusters.personalized")
+
+VlnPlot(pericytes_dcats, features = c("PDGFRB"), group.by = "harmony.clusters.personalized")
+
+
+
+
+```
+
+```{r}
+PDGFRB_gene_comb <- c(
+  "PDGFRB", "ICAM1", "VCAM1")
+
+ClusterMarkers |> filter(gene %in% PDGFRB_gene_comb) |> view()
+```
+
+## 5. Find pericytes_dcats phenotypes
+
+```{r}
+VlnPlot(
+    pericytes_dcats,
+    features = c(
+        "PDGFRB", "ICAM1", "VCAM1"
+    ),
+    group.by = "harmony.clusters.0.15",
+    pt.size = 0.1
+)
+```
+
+```{r}
+res_HealthyVsInf_df |> filter(str_starts(gene, "IL6")) |> 
+  pull(gene)
+```
+
+```{r, warning=FALSE}
+
+#NEGATIVE
+
+
+
+
+Cytokine_Response_Receptors <- c(
+  "IL6R","IL6ST",     # IL-6/gp130 axis
+  "IL1R1","IL1R2",    # IL-1 signaling & decoy
+  "OSMR","IL31RA",    # OSM/IL-31 axis (if present)
+  "TNFRSF25"          # DR3 (TL1A receptor)
+)
+
+
+Inmune_activation <- c("VCAM1", "ICAM1", "SELE", "SELPLG", "PECAM1", "CD44", "SERPING1")
+
+ProInf_Cytokines_activation <- c("CCL2", "CCL5", "CXCL1", "CXCL1", "CXCL8", "IL6", "TNF", "IL33", "CCL19", "CCL21", "MIF", "TNFRSF25", "TNFSF15", "IL11", "IL6R","IL1R2","IL1R1", "OSMR", "IL7" )
+
+Lipid_signaling <- c("PLA2G4A","PLA2G2A","PLA2G5","PLA2G10","PLA2G6",
+                     "PTGS1","PTGS2","PTGER1","PTGER2","PTGER3","PTGER4",
+                     "ALOX5","ALOX12","ALOX15")
+
+Antigen_presentation <- c("HLA-DRA", "HLA-DRB1", "HLA-DPA1", "HLA-DPB1", "CD74")
+
+Signaling_pathways <- c("STAT1", "NFKB1", "RELA", "STAT1","STAT2", "STAT5B", "STAT4",  "STAT5A", "STAT6", "STAT3","JAK3",  "JAK1", "JAKMIP3", "JAK2")
+
+#POSITIVE
+
+AntiInf_Cytokines <- c("IL27RA", "IL10RA", "IL10RB-DT", "IL10RB","TGFB3", "TGFBR1",  "TGFBR2",  "TGFBR3L",  "TGFB1I1",  "TGFB2",  "TGFBR3", "TGFBRAP1", "TGFB1","TGFBI")
+
+contractile_genes <- c("ACTA2", "MYH11", "TAGLN", "CNN1", "TPM1", "TPM2")
+
+vasc_support <- c("PDGFRB", "RGS5", "KCNJ8", "ABCC9", "CSPG4")
+
+basal_membrane <- c("COL4A1", "COL4A2", "LAMA4", "FN1")
+
+angiogenesis <- c("ANGPT1", "TIMP3", "MGP")
+
+pericytes_dcats <- AddModuleScore(pericytes_dcats, features = list(Lipid_signaling), name = "LipidProInflammatorySignaling")
+
+
+
+
+
+
+pericytes_dcats <- AddModuleScore(pericytes_dcats, features = list(contractile_genes), name = "ContractileScore")
+
+
+
+pericytes_dcats <- AddModuleScore(pericytes_dcats, features = list(Inmune_activation), name = "InmuneActivation_Score")
+
+pericytes_dcats <- AddModuleScore(pericytes_dcats, features = list(Cytokines_activation), name = "CytokinesActivation_Score")
+
+
+pericytes_dcats <- AddModuleScore(pericytes_dcats, features = list(Antigen_presentation), name = "AntigenPresentation_Score")
+
+
+pericytes_dcats <- AddModuleScore(pericytes_dcats, features = list(Signaling_pathways), name = "SignalingPathways_Score")
+
+
+
+```
+
+```{r}
+cluster_avg <- pericytes_dcats@meta.data |> 
+  mutate(ContractileScore = pericytes_dcats$ContractileScore1) |> 
+  mutate(InmuneActivation_Score = pericytes_dcats$InmuneActivation_Score1) |> 
+  mutate(CytokinesActivation_Score = pericytes_dcats$CytokinesActivation_Score1) |> 
+  mutate(SignalingPathways_Score = pericytes_dcats$SignalingPathways_Score1) |>
+  mutate(AntigenPresentation_Score = pericytes_dcats$AntigenPresentation_Score1) |>
+  mutate(Lipid_signaling_Score = pericytes_dcats$LipidProInflammatorySignaling1) |> 
+  group_by(harmony.clusters.personalized) |> 
+  summarize(Contractile_MeanScore = mean(ContractileScore, na.rm = TRUE),
+  InmuneActivation_MeanScore = mean(InmuneActivation_Score, na.rm = TRUE),
+  CytokinesActivation_MeanScore = mean(CytokinesActivation_Score, na.rm = TRUE),
+  SignalingPathways_MeanScore = mean(SignalingPathways_Score, na.rm = TRUE),
+  AntigenPresentation_MeanScore = mean(AntigenPresentation_Score, na.rm = TRUE),
+  LipidProInflammatorySignaling_MeanScore = mean(Lipid_signaling_Score, na.rm = TRUE))
+```
+
+```{r}
+VlnPlot(
+    pericytes_dcats,
+    features = c(
+       "CytokinesActivation_Score1"
+    ),
+    group.by = "harmony.clusters.personalized",
+    pt.size = 0.1
+)
+
+Idents(pericytes_dcats) <- "harmony.clusters.personalized"
+FeaturePlot(pericytes_dcats, features = c("InmuneActivation_Score1"), label = T)
+```
+
+#### 5.1 Wilcoxon Pairwise Comparison
+
+```{r}
+score_cols <- c("Contractile_MeanScore",
+                "InmuneActivation_MeanScore",
+                "CytokinesActivation_MeanScore",
+                "SignalingPathways_MeanScore",
+                "AntigenPresentation_MeanScore",
+                "LipidProInflammatorySignaling_MeanScore")
+
+
+score_labels <- c(
+  Contractile_MeanScore              = "Contractile program",
+  InmuneActivation_MeanScore         = "Immune Adhesion / Activation",
+  CytokinesActivation_MeanScore      = "Cytokine/Chemokine Production/Receptors",
+  SignalingPathways_MeanScore        = "Inflammatory Signaling pathways (JAK/STAT, NF-κB)",
+  AntigenPresentation_MeanScore      = "Antigen presentation (MHC-II)",
+  LipidProInflammatorySignaling_MeanScore = "Lipid mediator signaling"
+)
+
+df_long <- cluster_avg|>
+  pivot_longer(cols = all_of(score_cols),
+               names_to = "Score",
+               values_to = "MeanScore")
+
+plots <- lapply(unique(df_long$Score), function(s) {
+  df_s <- df_long|>
+    filter(Score == s)|>
+    mutate(cluster = factor(harmony.clusters.personalized))|>
+    arrange(desc(MeanScore))|>
+    mutate(cluster = factor(cluster, levels = cluster))
+
+  lim <- max(abs(df_s$MeanScore), na.rm = TRUE)
+
+  ggplot(df_s, aes(x = cluster, y = MeanScore, fill = MeanScore)) +
+    geom_col(width = 0.72, color = "grey30", linewidth = 0.2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_text(aes(label = sprintf("%.2f", MeanScore),
+                  vjust = ifelse(MeanScore >= 0, -0.25, 1.25)),
+              size = 3.2) +
+    scale_fill_gradient2(
+      low = "#2C7BB6", mid = "#F7F7F7", high = "#D7191C",
+      midpoint = 0, limits = c(-lim, lim),
+      name = "Mean score"
+    ) +
+    coord_cartesian(ylim = c(-lim*1.15, lim*1.15), clip = "off") +
+    labs(
+      title = score_labels[[s]] %||% s,
+      x = "Cluster",
+      y = "Mean module score"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, margin = margin(b = 6)),
+      axis.title.x = element_text(face = "bold"),
+      axis.title.y = element_text(face = "bold"),
+      axis.text.x  = element_text(size = 10),
+      axis.text.y  = element_text(size = 10),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      legend.position = "right",
+      plot.margin = margin(8, 16, 8, 8)
+    )
+})
+
+for (p in plots) print(p)
+
+
+#
+for (i in seq_along(plots)) {
+   ggsave(filename = paste0(unique(df_long$Score)[i], ".png"),
+          plot = plots[[i]],  width = 14, height = 10, dpi = 400)
+ }
+```
+
+```{r}
+umap_studycase_15
+```
