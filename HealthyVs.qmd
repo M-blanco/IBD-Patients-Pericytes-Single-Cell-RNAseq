@@ -1,0 +1,1183 @@
+---
+title: "Pericytes"
+author: "Miguel Blanco"
+format: html
+editor: visual
+---
+
+### Load Libraries
+
+```{r}
+suppressPackageStartupMessages({
+library(SeuratData)
+library(tidyverse)
+library(Seurat)
+library(ggplot2)
+library(ggrepel)
+library(tibble)
+library(DESeq2)
+library(patchwork)
+library(clustree)
+library(fgsea)
+})
+```
+
+```{r}
+base_dir <- "/home/projects/dtu_00062/people/migchi/Pericytes/HealthyVs/"
+
+pericytes <- readRDS(file = file.path(base_dir, "Pericytes_healthyVs.rds"))
+
+
+```
+
+### 1. Run Seurat Workflow (PCA, UMAP, Integration and Clustering)
+
+```{r}
+pericytes <- JoinLayers(pericytes)
+```
+
+```{r}
+pericytes[["RNA"]] <- split(pericytes[["RNA"]], f = pericytes$Sequencing_Batch)
+```
+
+### 1.1 Rerun PCA and Integration
+
+```{r}
+pericytes <- NormalizeData(pericytes, normalization.method = "LogNormalize", scale.factor = 10000, verbose = FALSE, layer = "counts*")
+pericytes <- FindVariableFeatures(pericytes, selection.method = "vst", layer = "data*")
+pericytes <- ScaleData(pericytes, verbose = F)
+pericytes <- RunPCA(pericytes)
+```
+
+```{r}
+dim(Embeddings(pericytes, reduction = "pca"))
+```
+
+```{r}
+PCApercentVarianceExplained <- function(Seurat_object)
+  {
+    std_devpc <- Seurat_object@reductions$pca@stdev
+    pc_explainedvariance <- (std_devpc^2) / sum(std_devpc^2) * 100
+    print(cumsum(pc_explainedvariance))
+}
+
+PCApercentVarianceExplained(pericytes)
+
+```
+
+```{r}
+dim(Embeddings(pericytes, reduction = "pca"))
+
+pc_scores <- Embeddings(pericytes, "pca")[, 1:2]   # first 2 PCs
+pc_scores <- as.data.frame(pc_scores)
+pc_scores$patient <- pericytes$Patient_studycase
+
+
+patient_coords <- pc_scores |> 
+  group_by(patient) |> 
+  summarise(PC1 = mean(PC_1),
+            PC2 = mean(PC_2)) |> 
+  mutate(condition = case_when(grepl("Healthy", patient) ~ "Healthy",
+                               TRUE ~ "Inflamed"))
+
+
+
+
+PCAplot <- ggplot(patient_coords, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 4) +
+  geom_text(aes(label = patient), vjust = -1, size = 3, show.legend = FALSE) +
+  theme_classic() +
+  labs(x = "PC1 (17.92%)", y = "PC2 (9.78%)",
+       title = "Pericytes PCA") +
+  scale_color_manual(
+    values = c("Healthy" = "#1f77b4",   
+               "Inflamed" = "#d62728")) +
+  theme(plot.title = element_text(face = "bold",
+                                  hjust = 0.5))
+
+
+
+ggsave(PCAplot, file = "HealthyVs/PCAplot.png", width = 12, height = 10, dpi = 400)
+```
+
+### 1.1.2 Run MDS
+
+```{r}
+#Extract N components coordinates for all the cells
+pca_coords <- Embeddings(pericytes, reduction = "pca")[, 1:10]
+
+
+#Create a dataframe with that coordinates and also a "patient" column that indicates the patient to who each cell belongs
+pca_df <- data.frame(pca_coords,
+                     patient = pericytes$Patient,
+                     Patient_Inflammation = pericytes$Patient_studycase)
+
+#Calculate aggregate coordinates for each PC for each patient
+
+centroids <- pca_df |> 
+  #group_by(patient) |> 
+  group_by(Patient_Inflammation) |> 
+  summarise(across(starts_with("PC"), mean)) |> 
+  ungroup()
+
+
+# Compute Euclidean distances between patient centroids
+dist_matrix <- dist(centroids |> dplyr::select(starts_with("PC")))
+
+# Classical MDS
+mds_coords <- cmdscale(dist_matrix, k = 2)
+
+# Combine into data frame
+mds_df <- data.frame(mds_coords, 
+                    #Patient = centroids$patient,
+                     Patient_Inflammation = centroids$Patient_Inflammation)
+
+colnames(mds_df)[1:2] <- c("MDS1", "MDS2")
+
+
+mds_df$Color <- case_when(
+  grepl("^P.*inflamed_CD", mds_df$Patient_Inflammation) ~ "P_Inflamed",
+  grepl("^P.*Healthy_CRC", mds_df$Patient_Inflammation) ~ "P_Healthy",
+  grepl("^H.*Non_inflamed_CD", mds_df$Patient_Inflammation) ~ "H_NonInflamed",
+  grepl("^H.*Healthy_CRC", mds_df$Patient_Inflammation) ~ "H_NonInflamed",
+  TRUE ~ "H_Inflammed"
+)
+
+
+mds <- ggplot(mds_df, aes(x = MDS1, y = MDS2, label = Patient_Inflammation, color = Color)) +
+  geom_point(size = 4) +
+  geom_text(vjust = -0.8, size = 3) +
+  theme_minimal() +
+  labs(title = "MDS of Patient PCA Centroids",
+       subtitle = "Based on average PC1–PC10 profiles")
+
+ggsave(mds, filename = "mds.png", width = 12, height = 10, dpi = 400)
+mds
+```
+
+#### 1.2 Run UMAPs and Integration
+
+```{r}
+pericytes <- FindNeighbors(pericytes, dims = 1:24, reduction = "pca")
+pericytes <- FindClusters(pericytes, resolution = 0.5, cluster.name = "unintegrated_clusters")
+```
+
+```{r}
+pericytes <- RunUMAP(pericytes, reduction = "pca", dims = 1:25, reduction.name = "unintegrated_UMAP")
+
+DimPlot(pericytes, reduction = "unintegrated_UMAP", group.by = "Sequencing_Batch")
+DimPlot(pericytes, reduction = "unintegrated_UMAP", group.by = "unintegrated_clusters")
+```
+
+#### 1.2.1 Integrate Layers
+
+```{r, warning=FALSE}
+pericytes <- IntegrateLayers(pericytes, method = HarmonyIntegration, 
+                orig.reduction = "pca", 
+                new.reduction = "harmony.integrated",
+                group.by = "Sequencing_Batch",
+                verbose = FALSE)
+```
+
+```{r}
+pericytes <- FindNeighbors(pericytes, reduction = "harmony.integrated", dims = 1:25, verbose = FALSE)
+
+```
+
+```{r}
+pericytes <- RunUMAP(pericytes, reduction = "harmony.integrated", dims = 1:25, reduction.name = "harmony_UMAP", verbose = F)
+
+p1 <- DimPlot(pericytes, reduction = "unintegrated_UMAP",  group.by = "Sequencing_Batch")
+p2 <- DimPlot(pericytes, reduction = "harmony_UMAP",  group.by = "Sequencing_Batch")
+
+wrap_plots(p1,p2, ncol = 2, byrow = F)
+p1
+p2
+```
+
+```{r}
+saveRDS(pericytes, file = "HealthyVs/Pericytes_healthyVs.rds")
+```
+
+```{r}
+pericytes <- readRDS(file = "HealthyVs/Pericytes_healthyVs.rds")
+```
+
+### 1.3 Decide cluster resolution
+
+```{r}
+pericytes <- FindClusters(pericytes, resolution = 0.1, cluster.name = "harmony.clusters.0.1", verbose = FALSE )
+pericytes <- FindClusters(pericytes, resolution = 0.15, cluster.name = "harmony.clusters.0.15", verbose = FALSE )
+pericytes <- FindClusters(pericytes, resolution = 0.3, cluster.name = "harmony.clusters.0.3", verbose = FALSE )
+pericytes <- FindClusters(pericytes, resolution = 0.5, cluster.name = "harmony.clusters.0.5", verbose = FALSE )
+pericytes <- FindClusters(pericytes, resolution = 0.7, cluster.name = "harmony.clusters.0.7", verbose = FALSE )
+```
+
+```{r, warning=FALSE}
+
+
+p0 <- DimPlot(pericytes, reduction = "harmony_UMAP",  group.by = "harmony.clusters.0.1", label = T)
+p1 <- DimPlot(pericytes, reduction = "harmony_UMAP",  group.by = "harmony.clusters.0.15", label = T)
+p2 <- DimPlot(pericytes, reduction = "harmony_UMAP",  group.by = "harmony.clusters.0.3", label = T)
+p3 <- DimPlot(pericytes, reduction = "harmony_UMAP",  group.by = "harmony.clusters.0.5", label = T)
+
+p <- wrap_plots(p0, p1, p2, p3, ncol = 2, nrow = 2, byrow = F)
+
+ggsave("HealthyVs/pericytes_clust_resUMAP.png", plot = p, width = 15, height = 9, dpi = 400)
+p
+```
+
+```{r}
+clustree(pericytes, prefix = "harmony.clusters.")
+
+```
+
+Res 0.15 is the one that represents better our scenario. However, I think clusters 2 and 5 should be separated like in res 0.3. Let's change that manually
+
+```{r}
+pericytes@meta.data <- pericytes@meta.data |> 
+  mutate(harmony.clusters.0.15 = case_when(harmony.clusters.0.3 == "5" ~ "6",
+                                           TRUE ~ harmony.clusters.0.15))
+```
+
+```{r}
+p1 <- DimPlot(pericytes, reduction = "harmony_UMAP",  group.by = "harmony.clusters.0.15", label = T)
+p1
+```
+
+Cluster 3 and 8 together?
+
+```{r, warning=FALSE}
+p <- DimPlot(pericytes, reduction = "harmony_UMAP", 
+             group.by = "harmony.clusters.0.15", 
+             split.by = "study_case",
+             label = T)
+
+ggsave("HealthyVs/pericytes_splitUMAP.png", plot = p, width = 15, height = 9, dpi = 400)
+p
+```
+
+```{r}
+Idents(pericytes) <- "harmony.clusters.0.15"
+```
+
+Looks like the we have more cells in the lower part of the UMAP in inflamed samples (more populated clusters 1, 3 and 8) while in non inflamed samples we seem to have a higher relative abundance in cluster 4
+
+```{r}
+pericytes <- JoinLayers(pericytes)
+```
+
+## 2. Run DEG (Pseudobulk Approach)
+
+### 2.1 Get aggregate expression per patient
+
+```{r}
+counts <- AggregateExpression(object = pericytes,
+                              assays = "RNA",
+                              group.by = "Patient_studycase",
+                              return.seurat = F)
+```
+
+```{r}
+counts <- counts$RNA
+counts <- as.data.frame(counts)
+```
+
+```{r}
+colData <- data.frame(patient = rownames(t(counts)))
+
+colData <- colData |>
+  mutate(study_case = case_when(
+    grepl("Non-inflamed-CD", patient) ~ "Non_inflamed_CD",
+    grepl("inflamed-CD", patient) ~ "inflamed_CD",
+    grepl("Healthy-CRC", patient) ~ "Healthy_CRC"
+  )) |>
+  mutate(patient = sub("-.*", "", patient)) |>   # extract HH01 from HH01-inflamed-CD
+  mutate(patient_studycase = paste0(patient, "_", study_case))      # get first letter (H or P)
+
+rownames(colData) <- colnames(counts)
+colData$batch <- pericytes@meta.data[rownames(colData), "Sequencing_batch"]
+```
+
+```{r}
+library(dplyr)
+colData <- tibble(sample = colnames(counts)) %>%
+  mutate(
+    study_case = case_when(
+      grepl("Non-inflamed-CD", sample) ~ "Non_inflamed_CD",
+      grepl("inflamed-CD",     sample) ~ "inflamed_CD",
+      grepl("Healthy-CRC",     sample) ~ "Healthy_CRC",
+      TRUE ~ NA_character_
+    ), 
+    patient = sub("-.*", "", sample),                 # "HH01" from "HH01-inflamed-CD"
+  )
+rownames(colData) <- colData$sample
+
+colData <- colData |> 
+  mutate(sample_key = gsub("-", "_", sample))
+
+meta <- pericytes@meta.data %>%
+  transmute(
+    # build the same key you used in colData
+    sample_key = paste0(Patient, "_", study_case),   # <-- adjust to your column names
+    batch = Sequencing_Batch
+  ) %>%
+  filter(!is.na(sample_key), !is.na(batch)) %>%
+  group_by(sample_key) %>%
+  summarise(batch = names(sort(table(batch), decreasing = TRUE))[1], .groups = "drop") 
+  # (mode of batch per sample_key; use first() if they're constant)
+
+
+colData <- colData %>%
+  left_join(meta, by = "sample_key")   # adds `batch`
+
+# sanity checks
+table(colData$study_case, colData$batch, useNA = "ifany")
+sum(is.na(colData$batch))
+```
+
+```{r}
+table(colData$study_case, colData$patient)
+```
+
+```{r}
+colData$patient <- factor(colData$patient)
+colData$study_case <- factor(colData$study_case)
+colData$batch <- factor(colData$batch)
+```
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = counts, 
+                              colData = colData, 
+                              design = ~ study_case)
+
+genes_to_keep <- rowSums(counts(dds)) >= 10
+dds <- dds[genes_to_keep, ]
+```
+
+```{r}
+table(colData$patient, colData$study_case)
+```
+
+```{r}
+dds$study_case <- relevel(dds$study_case, ref = "Healthy_CRC")
+dds <- DESeq(dds)
+```
+
+With this reference for the comparison, recall that log2FC \<0 = upregulated in inflammed
+
+```{r}
+resultsNames(dds)
+res_HealthyVsInf <- results(dds, name = "study_case_inflamed_CD_vs_Healthy_CRC", alpha = 0.05 )
+res_NIVshealthy <- results(dds, name = "study_case_Non_inflamed_CD_vs_Healthy_CRC", alpha = 0.05)
+res_HealthyVsInf_df <- as.data.frame(res_HealthyVsInf)
+res_NIVshealthy_df <- as.data.frame(res_NIVshealthy)
+summary(res_HealthyVsInf)
+summary(res_NIVshealthy)
+```
+
+```{r}
+res_HealthyVsInf_df <- res_HealthyVsInf_df |> 
+  rownames_to_column(var = "gene") |> 
+  as_tibble() |> 
+  arrange(padj)
+
+res_NIVshealthy_df <- res_NIVshealthy_df |> 
+  rownames_to_column(var = "gene") |> 
+  as_tibble() |> 
+  arrange(padj)
+```
+
+```{r}
+sig_res_NIVshealthy_ <- res_NIVshealthy_df |> 
+  filter(padj < 0.05) |> 
+  arrange(desc(abs(log2FoldChange)))
+
+sig_res_healthyVsInf <- res_HealthyVsInf_df |> 
+  filter(padj < 0.05) |> 
+  #arrange(padj)  
+  arrange(desc(abs(log2FoldChange)))
+
+dim(sig_res_NIVshealthy)
+dim(sig_res_healthyVsInf)
+head(sig_res_NIVshealthy)
+head(sig_res_healthyVsInf)
+```
+
+Save tables
+
+```{r}
+write_csv(sig_res_NIVshealthy, file = "HealthyVs//sig_res_NIVshealthy.csv")
+write_csv(sig_res_healthyVsInf, file = "HealthyVs//sig_res_healthyVsInf.csv")
+```
+
+### 2.2 Look for specific genes
+
+```{r}
+genes_specific <- c("VCAM1", "ICAM1", "PDGFB", "IL10", "CXCL1", "CCL2", "IL33", "CCL19", "CCL21", "TGFB1")
+
+res_HealthyVsInf_df |> filter(gene %in% genes_specific)
+
+sig_res_healthyVsInf |> filter(gene %in% genes_specific)
+```
+
+```{r}
+VlnPlot(pericytes, features = c("VCAM1"), group.by = "study_case")
+
+VlnPlot(pericytes, features = c("ICAM1"), group.by = "study_case") 
+```
+
+x
+
+```{r}
+sig_res_healthyVsInf |> filter(gene == "IL33")
+```
+
+### Volcano Plots
+
+```{r}
+all_genes = sig_res_healthyVsInf$gene
+top_genes_healthy_INF <- head(sig_res_healthyVsInf, 20)
+top_genes_healthy_padj <- head(sig_res_healthyVsInf |> arrange(padj), 5)
+
+top_genes_healthy_INF <- bind_rows(top_genes_healthy_INF, top_genes_healthy_padj) |> distinct(gene, .keep_all = T)
+
+relevant_genes <- c("IL7", "IL33", "IL17B", "MIF", "JAK3","CCL11", "CCL21", "CXCL2", "VCAM1", "CD44", "SERPING1", "CASP4", "PTGER1", "PTGER3", "PTGES", "PLA2G2A", "PLA2G5", "IGFBP4")
+
+relevant_genes_df <- sig_res_healthyVsInf |> filter(gene %in% relevant_genes)
+
+label_genes_df <- bind_rows(top_genes_healthy_INF, relevant_genes_df) %>%
+  distinct(gene, .keep_all = TRUE)
+
+
+
+
+Volcano_HealthyvsInf <- ggplot(sig_res_healthyVsInf, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = padj < 0.05 & abs(log2FoldChange) > 1), alpha = 0.6) +
+  scale_color_manual(values = c("FALSE" = "blue", "TRUE" = "red"),
+                     name = "Significant") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey") +
+  geom_text_repel(data = label_genes_df,
+                  aes(label = gene),
+                  size = 3.5, max.overlaps = Inf,
+                  segment.color = "black",
+                  segment.size = 0.3,
+                  arrow = arrow(length = unit(0.2, "npc"))) +
+  labs(title = "Volcano Plot Healthy Vs Inflamed", x = "Log2 Fold Change", y = "-log10 adjusted p-value") +
+  theme_minimal()+
+  theme(plot.title = element_text(face = "bold"), hjust = 0.5)
+
+Volcano_HealthyvsInf
+```
+
+```{r}
+
+plot_df <- res_HealthyVsInf_df |>
+  mutate(y = -log10(padj),
+         color = case_when(padj < 0.05 & gene %in% relevant_genes ~ "TRUE & Inflammation Related",
+                           padj < 0.05 ~ "TRUE",
+                           TRUE ~ "FALSE")) |> 
+  filter(is.finite(log2FoldChange), is.finite(y), padj > 0)
+
+Volcano_HealthyINF_reshape <- ggplot(plot_df |> filter(!gene %in% c("SLN", "TUSC3", "PRRX1")), aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = color), alpha = 0.6) +
+  scale_color_manual(values = c("FALSE" = "blue", "TRUE" = "red", "TRUE & Inflammation Related" = "#f1c40f"),
+                     name = "Significant") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey") +
+  geom_text_repel(data = label_genes_df |> filter(!gene %in% c("SLN", "TUSC3", "PRRX1")),
+                  aes(label = gene),
+                  size = 3.5, max.overlaps = Inf,
+                  segment.color = "black",
+                  segment.size = 0.3,
+                  arrow = arrow(length = unit(0.2, "npc"))) +
+  labs(title = "Volcano Plot Healthy Vs Inflamed", x = "Log2 Fold Change", y = "-log10 adjusted p-value") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))+
+  coord_cartesian(xlim = c(-8, 8), ylim = c(0, 10.5))
+
+Volcano_HealthyINF_reshape
+```
+
+```{r}
+Volcano_HealthyINF_reshape_onlyrelevant <- ggplot(plot_df |> filter(!gene %in% c("SLN", "TUSC3", "PRRX1")), aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = color), alpha = 0.6) +
+  scale_color_manual(values = c("FALSE" = "blue", "TRUE" = "red", "TRUE & Inflammation Related" = "#f1c40f"),
+                     name = "Significant") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey") +
+  geom_text_repel(data = relevant_genes_df,
+                  aes(label = gene),
+                  size = 3.5, max.overlaps = Inf,
+                  segment.color = "black",
+                  segment.size = 0.3,
+                  arrow = arrow(length = unit(0.2, "npc"))) +
+  labs(title = "Volcano Plot Healthy Vs Inflamed", x = "Log2 Fold Change", y = "-log10 adjusted p-value") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))+
+  coord_cartesian(xlim = c(-8, 8), ylim = c(0, 10.5))
+
+Volcano_HealthyINF_reshape_onlyrelevant
+```
+
+```{r}
+#ggsave(filename = "HealthyVs/Volcano/volcano_NIvsHealthy.png", plot = Volcano_NIvsHealthy, width = 14, height = 12, dpi = 300)
+
+ggsave(filename = "HealthyVs/Volcano/volcano_HealthyvsINF.png", plot = Volcano_HealthyvsInf, width = 14, height = 12, dpi = 300, bg = "white")
+
+ggsave(filename = "HealthyVs/Volcano/volcano_HealthyvsINF_reshape.png", plot = Volcano_HealthyINF_reshape, width = 14, height = 12, dpi = 300, bg = "white")
+
+ggsave(filename = "HealthyVs/Volcano/volcano_HealthyvsINF_reshape_onlyrelevant.png", plot = Volcano_HealthyINF_reshape_onlyrelevant, width = 14, height = 12, dpi = 300, bg = "white")
+```
+
+### HeatMap
+
+```{r}
+library(pheatmap)
+# Extract gene names
+heatmap_genes_CDINF <- head(sig_res_healthyVsInf$gene, 25)
+
+# Extract VST-transformed counts for those genes
+norm_counts_CDINF <- assay(vst(dds, blind = TRUE))
+
+
+ann_col <- as.data.frame(colData(dds)[, "study_case", drop = FALSE])
+rownames(ann_col) <- colnames(dds)
+
+order <- order(ann_col$study_case)
+norm_counts_CDINF <- norm_counts_CDINF[, order]
+
+ann_col <- ann_col |> 
+  arrange(study_case)
+# Plot heatmap
+heatmap_top25 <- pheatmap(norm_counts_CDINF, 
+         cluster_rows = FALSE, 
+         show_rownames = TRUE,
+         cluster_cols = FALSE, 
+         annotation_col = ann_col)
+
+heatmap_top25
+```
+
+```{r}
+library(pheatmap)
+# Extract gene names
+heatmap_genes_CDINF <- relevant_genes
+
+# Extract VST-transformed counts for those genes
+norm_counts_CDINF <- assay(vst(dds, blind = TRUE))[heatmap_genes_CDINF, ]
+
+
+ann_col <- as.data.frame(colData(dds)[, "study_case", drop = FALSE])
+rownames(ann_col) <- colnames(dds)
+
+order <- order(ann_col$study_case)
+norm_counts_CDINF <- norm_counts_CDINF[, order]
+
+ann_col <- ann_col |> 
+  arrange(study_case)
+# Plot heatmap
+heatmap_top25 <- pheatmap(norm_counts_CDINF, 
+         cluster_rows = FALSE, 
+         show_rownames = TRUE,
+         cluster_cols = FALSE, 
+         annotation_col = ann_col)
+
+heatmap_top25
+
+
+
+
+
+
+## PDGFR, VCAM and ICAM heatmap
+
+
+
+
+
+heatmap_genes_PDGFR <- c("VCAM1", "ICAM1", "PDGFB")
+
+heatmap_genes_PDGFR <- c("MIF", "CXCL1", "CCL2")
+
+
+# Extract VST-transformed counts
+norm_counts_PDGFR <- assay(vst(dds, blind = TRUE))[heatmap_genes_PDGFR, ]
+
+# Create annotation dataframe
+ann_col <- as.data.frame(colData(dds)[, "study_case", drop = FALSE])
+rownames(ann_col) <- colnames(dds)
+
+# Filter to specific patients
+keep_samples <- rownames(ann_col)[ann_col$patient_studycase %in% Patients_studycase_tokeep]
+inflamed_patients <- grep("inflamed", Patients_studycase_tokeep, value = TRUE)
+
+
+
+
+# Subset both counts and annotation
+norm_counts_PDGFR <- norm_counts_PDGFR[, keep_samples]
+ann_col <- ann_col[keep_samples, , drop = FALSE]
+
+ann_col$inflamed <- ifelse(ann_col$patient_studycase %in% inflamed_patients, "Inflamed", "Healthy")
+ann_colors <- list(Highlight = c(Inflamed = "red", Healthy = "green"))
+
+# Order by patient
+order <- order(ann_col$study_case)
+norm_counts_PDGFR <- norm_counts_PDGFR[, order]
+ann_col <- ann_col[order, , drop = FALSE]
+
+# Plot heatmap
+heatmap_PDGFR <- pheatmap(norm_counts_PDGFR, 
+                          cluster_rows = FALSE, 
+                          show_rownames = TRUE,
+                          cluster_cols = FALSE,
+                          annotation_col = ann_col,
+                          annotation_colors = ann_colors)
+heatmap_PDGFR
+
+
+
+
+
+
+
+```
+
+```{r}
+plot_deg_heatmap <- function(
+  dds,
+  sig_genes,
+  sample_key_col = "sample_key",
+  condition_col  = "study_case",
+  collapse_to_patient = TRUE,
+  use_vst = TRUE,
+  subset_conditions = NULL,          
+  split_by_condition = TRUE,         
+  condition_levels = NULL,           
+  palette = c("purpleYellow","blueWhiteRed"),
+  z_limits = c(-2.5, 2.5),
+  cond_colors = NULL,
+  palette_seed = NULL,
+  show_gene_names = F,
+  row_name_fontsize = 7,
+  file_pdf = NULL,                   # e.g. "DEG_heatmap_by_patient.pdf"
+  file_png = NULL,                   # e.g. "DEG_heatmap_by_patient.png"
+  png_width = 2000, png_height = 1600, png_res = 200
+){
+  stopifnot(inherits(dds, "DESeqDataSet"))
+  palette <- match.arg(palette)
+
+  suppressPackageStartupMessages({
+    library(ComplexHeatmap); library(circlize); library(dplyr)
+    library(DESeq2)
+  })
+
+  ## --- matrix log-like ---
+  mat <- if (use_vst) assay(vst(dds, blind = TRUE)) else {
+    stop("Provide a log-like matrix yourself if use_vst = FALSE.")
+  }
+  
+  
+  cluster_rows_flag <- !isTRUE(show_gene_names) 
+
+  ## --- Make sure only to include present genes ---
+  genes_present <- intersect(sig_genes, rownames(mat))
+  if (length(genes_present) < 5L)
+    stop("Fewer than 5 significant genes found in expression matrix rownames.")
+  mat <- mat[genes_present, , drop = FALSE]
+
+  ## --- colData ---
+  cd <- as.data.frame(colData(dds))
+  req <- c(sample_key_col, condition_col)
+  if (!all(req %in% names(cd)))
+    stop("colData(dds) must contain: ", paste(req, collapse=", "))
+
+  cd[[sample_key_col]] <- droplevels(as.factor(cd[[sample_key_col]]))
+  cd[[condition_col]]  <- droplevels(as.factor(cd[[condition_col]]))
+
+  ## Align columns
+  cd <- cd[colnames(mat), , drop = FALSE]
+
+  ## --- Colapse as avg per patient ---
+  if (collapse_to_patient) {
+    grp <- cd[[sample_key_col]]
+    mat <- t(rowsum(t(mat), group = grp)) / as.vector(table(grp))
+
+    
+    patient_to_cond <- tapply(cd[[condition_col]], grp, function(v){
+      vv <- as.character(v); names(sort(table(vv), decreasing = TRUE))[1]
+    })
+    top_annot_df <- data.frame(
+      study_case = factor(patient_to_cond[ colnames(mat) ])
+    )
+    rownames(top_annot_df) <- colnames(mat)
+  } else {
+    top_annot_df <- data.frame(
+      sample_key = cd[[sample_key_col]],
+      study_case = cd[[condition_col]]
+    )
+    rownames(top_annot_df) <- rownames(cd)
+  }
+
+  ## --- filter conditions ---
+  if (!is.null(subset_conditions)) {
+    keep <- as.character(top_annot_df$study_case) %in% subset_conditions
+    mat <- mat[, keep, drop = FALSE]
+    top_annot_df <- droplevels(top_annot_df[keep, , drop = FALSE])
+    if (ncol(mat) < 2) stop("After filtering, fewer than 2 columns remain.")
+  }
+
+  ## --- order by condition ---
+  if (is.null(condition_levels)) {
+    condition_levels <- levels(droplevels(as.factor(top_annot_df$study_case)))
+  }
+  top_annot_df$study_case <- factor(top_annot_df$study_case, levels = condition_levels)
+
+  
+  
+  ## --- Z-score per gene ---
+  mat_z <- t(scale(t(mat)))
+  keep_cols <- !is.na(top_annot_df$study_case)
+  if (!all(keep_cols)) {
+    mat      <- mat[, keep_cols, drop = FALSE]      
+    mat_z    <- mat_z[, keep_cols, drop = FALSE]    
+  top_annot_df <- droplevels(top_annot_df[keep_cols, , drop = FALSE])
+  }
+  mat_z <- mat_z[keep_rows, , drop = FALSE]
+
+  ## --- palettes ---
+  col_fun <- switch(palette,
+    purpleYellow = circlize::colorRamp2(
+      c(z_limits[1], 0, z_limits[2]),
+      c("#5B2A86", "#FFFFFF", "#FDE725")
+    ),
+    blueWhiteRed = circlize::colorRamp2(
+      c(z_limits[1], 0, z_limits[2]),
+      c("#2C7BB6", "#F7F7F7", "#D7191C")
+    )
+  )
+
+  # Color per condition
+  
+  cond_levels <- levels(top_annot_df$study_case)
+  
+  if (!is.null(cond_colors)) {
+    # expect a *named* vector: names must be condition labels
+    if (!all(cond_levels %in% names(cond_colors)))
+      stop("cond_colors must be a named vector covering: ",
+           paste(cond_levels, collapse = ", "))
+    cond_cols <- cond_colors[cond_levels]   # keep order of levels
+  } else if (!is.null(palette_seed)) {
+    set.seed(palette_seed)                  # reproducible random if you want it
+    cond_cols <- setNames(
+      circlize::rand_color(length(cond_levels), luminosity = "bright"),
+      cond_levels
+    )
+  } else {
+    # deterministic default (Okabe–Ito, color-blind friendly)
+    okabe <- c("#D55E00","#0072B2","#009E73","#CC79A7",
+               "#F0E442","#56B4E9","#E69F00","#000000")
+    if (length(cond_levels) > length(okabe))
+      stop("Provide cond_colors for >8 groups.")
+    cond_cols <- setNames(okabe[seq_along(cond_levels)], cond_levels)
+  }
+
+  ha <- HeatmapAnnotation(
+  Condition = top_annot_df$study_case,
+  col = list(Condition = cond_cols),
+  annotation_height = grid::unit(5, "mm"),
+  gp = grid::gpar(col = NA),
+  annotation_name_gp = grid::gpar(fontface = "bold"),  # estilo del nombre
+  annotation_legend_param = list(Condition = list(title = "Condition"))
+)
+
+  ## --- Order Columns ---
+  column_order <- seq_len(ncol(mat_z))
+  if (!split_by_condition) {
+    # By condition and then by cluster
+    hc_cols <- hclust(as.dist(1 - cor(mat_z, method = "pearson")), method = "average")
+    glob_ord <- hc_cols$order
+    idx_by_cond <- split(seq_len(ncol(mat_z)), top_annot_df$study_case)
+    column_order <- unlist(lapply(levels(top_annot_df$study_case), function(cl){
+      idx <- idx_by_cond[[cl]]; idx[order(match(idx, glob_ord))]
+    }))
+    mat_z        <- mat_z[, column_order, drop = FALSE]
+    top_annot_df <- top_annot_df[column_order, , drop = FALSE]
+    ha <- HeatmapAnnotation(
+  Condition = top_annot_df$study_case,
+  col = list(Condition = cond_cols),
+  annotation_height = grid::unit(5, "mm"),
+  gp = grid::gpar(col = NA),
+  annotation_name_gp = grid::gpar(fontface = "bold"),  # estilo del nombre
+  annotation_legend_param = list(Condition = list(title = "Condition"))
+)
+  }
+
+  ## --- Build heatmap ---
+  ht <- Heatmap(
+    mat_z,
+    name = "Z-score",
+    col = col_fun,
+    top_annotation = ha,
+    show_row_names = show_gene_names,
+    show_column_names = TRUE,
+    column_names_gp = grid::gpar(fontsize = 8),
+
+    cluster_rows = cluster_rows_flag,
+    cluster_columns = split_by_condition,   # si no hay split, fijamos orden manual
+    clustering_distance_rows = "pearson",
+    clustering_distance_columns = "pearson",
+
+    column_split = if (split_by_condition) top_annot_df$study_case else NULL,
+    cluster_column_slices = if (split_by_condition) FALSE else TRUE,
+    column_gap = if (split_by_condition) grid::unit(2.5, "mm") else grid::unit(0, "mm"),
+
+    use_raster = TRUE,
+    raster_quality = 2,
+    heatmap_legend_param = list(at = c(z_limits[1], 0, z_limits[2]), title = "Z-score")
+  )
+
+  ## --- guardar si se pide ---
+  if (!is.null(file_pdf)) {
+    pdf(file_pdf, width = if (collapse_to_patient) 10 else 14, height = 10)
+    draw(ht)
+    dev.off()
+  }
+  if (!is.null(file_png)) {
+    png(file_png, width = png_width, height = png_height, res = png_res)
+    draw(ht)
+    dev.off()
+  }
+
+  return(ht)
+}
+```
+
+```{r}
+
+
+ht1 <- plot_deg_heatmap(
+  dds, sig_genes = sig_res_healthyVsInf$gene,
+  collapse_to_patient = TRUE,
+  split_by_condition = F,
+  condition_levels = c("inflamed_CD","Non_inflamed_CD","Healthy_CRC"),
+  palette = "blueWhiteRed",
+  file_png = "HealthyVs/Heatmap/HT_Nonsplitted_allconditions.png"
+)
+
+ht1
+
+ht2 <- plot_deg_heatmap(
+  dds, sig_genes = sig_res_healthyVsInf$gene,
+  collapse_to_patient = TRUE,
+  split_by_condition = F,
+  condition_levels = c("inflamed_CD","Healthy_CRC"),
+  file_png = "HealthyVs/Heatmap/HT_Nonsplitted_HandInf.png",
+  palette = "blueWhiteRed"
+)
+
+ht2
+
+ht3 <- plot_deg_heatmap(
+  dds, sig_genes = sig_res_healthyVsInf$gene,
+  collapse_to_patient = TRUE,
+  split_by_condition = T,
+  condition_levels = c("inflamed_CD","Non_inflamed_CD", "Healthy_CRC"),
+  palette = "blueWhiteRed",
+  file_png = "HealthyVs/Heatmap/HT_splitted_allconditions.png"
+)
+
+ht3
+
+
+ht4 <- plot_deg_heatmap(
+  dds, sig_genes = sig_res_healthyVsInf$gene,
+  collapse_to_patient = TRUE,
+  subset_conditions = c("inflamed_CD", "Healthy_CRC"),
+  split_by_condition = T,
+  condition_levels = c("inflamed_CD","Healthy_CRC"),
+  palette = "blueWhiteRed",
+  file_png = "HealthyVs/Heatmap/HT_splitted_HandInf.png",
+)
+
+ht4
+
+
+ht5 <- plot_deg_heatmap(
+  dds, sig_genes = relevant_genes_df$gene,
+  collapse_to_patient = TRUE,
+  split_by_condition = F,
+  condition_levels = c("inflamed_CD","Healthy_CRC"),
+  palette = "blueWhiteRed",
+  show_gene_names = T,
+  file_png = "HealthyVs/Heatmap/HT_Nonsplitted_HandInf_relevant_genes.png",
+)
+
+
+ht5
+```
+
+```{r}
+table(pericytes$Patient_studycase, pericytes$Sequencing_Batch)
+```
+
+## 3. FGSEA
+
+```{r}
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+Entrez <- AnnotationDbi::select(org.Hs.eg.db,
+                                keys = res_HealthyVsInf_df$gene,
+                                columns = "ENTREZID",
+                                keytype = "SYMBOL")
+
+Entrez <- as_tibble(Entrez)
+
+res_HealthyVsInf_df <- inner_join(res_HealthyVsInf_df, Entrez, by = c("gene" = "SYMBOL"))
+
+res_HealthyVsInf_df <- res_HealthyVsInf_df |> 
+  filter(!is.na(ENTREZID), is.finite(pvalue), is.finite(log2FoldChange), pvalue > 0) |> 
+  mutate(ranked_score =  (-log10(pvalue) * sign(log2FoldChange)))
+
+rankdata <-  res_HealthyVsInf_df$ranked_score 
+names(rankdata) <- res_HealthyVsInf_df$ENTREZID
+
+
+
+```
+
+```{r}
+kegg_msigdb <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "BP")
+
+kegg_list <- kegg_msigdb |> 
+  split(x = kegg_msigdb$entrez_gene, f = kegg_msigdb$gs_name)
+
+rctome_pathways <- reactomePathways(names(rankdata))
+```
+
+```{r}
+
+
+fgsea_NIvsINF <- fgsea(pathways = kegg_list, stats = rankdata)
+
+fgsea_NIvsINF_reactome <- fgsea(pathways = rctome_pathways, stats = rankdata)
+
+
+
+```
+
+### 3.1 Collapse Pathways
+
+```{r}
+collapsedPathways <- collapsePathways(fgsea_NIvsINF[order(pval)][padj < 0.01], 
+                                      kegg_list, rankdata)
+mainPathways <- fgsea_NIvsINF[pathway %in% collapsedPathways$mainPathways][
+                         order(-NES), pathway]
+
+```
+
+Extract top pathways
+
+```{r}
+view(fgsea_NIvsINF_reactome |> filter(padj < 0.05))
+```
+
+```{r}
+extract_topbot_pathways <- function(fgsea_result, padj_threshold = 0.05, top_n = 10, bottom_n = 10, total_n = 20) {
+  fgsea_tidy <- as_tibble(fgsea_result)
+  
+  top <- fgsea_tidy |>
+    filter(padj < padj_threshold) |>
+    arrange(desc(NES)) |>
+    head(top_n)
+  
+  bottom <- fgsea_tidy |>
+    filter(padj < padj_threshold) |>
+    arrange(NES) |>
+    head(bottom_n)
+  
+  topabs <- fgsea_tidy |> 
+    filter(padj < padj_threshold) |> 
+    arrange(desc(abs(NES))) |> 
+    head(total_n)
+  
+  bot20 <- fgsea_tidy |>
+    filter(padj < 0.1) |>
+    arrange(NES) |>
+    head(total_n)
+  
+  topbot <- bind_rows(top, bottom)
+  return(list(topabs = topabs , topbot = topbot, bot20 = bot20, bottom = bottom))
+}
+
+
+
+
+Kegg_top <- extract_topbot_pathways(fgsea_NIvsINF)
+topbot_KEGG <- Kegg_top$topbot
+topabs_KEGG <- Kegg_top$topabs
+
+
+
+Rctome_top <- extract_topbot_pathways(fgsea_NIvsINF_reactome |>  filter(pathway != "Sensory processing of sound"))
+topbot_Rctome <- Rctome_top$topbot
+topabs_Rctome <- Rctome_top$topabs
+bot20_Rctome <- Rctome_top$bot20
+bot10_Rctome <- Rctome_top$bottom
+
+
+```
+
+```{r}
+interesting_pathways <- c("Interleukin-12 family signaling", "Collagen degradation", "Complement cascade", "Cytokine Signaling in Immune system", "Degradation of the extracellular matrix", "Interferon Signaling", "Modulation of host responses by IFN-stimulated genes", "Interferon gamma signaling", "Interleukin-4 and Interleukin-13 signaling", "Signaling by Interleukins", "Immune System", "Innate Immune System", "Antigen processing: Ub, ATP-independent proteasomal degradation", "Synthesis of Prostaglandins (PG) and Thromboxanes (TX)", "Modulation of host responses by IFN-stimulated genes")
+
+
+interesting_pathways_all <- c("Interleukin-12 family signaling", "Collagen degradation", "Complement cascade", "Cytokine Signaling in Immune system", "Degradation of the extracellular matrix", "Interferon Signaling", "Modulation of host responses by IFN-stimulated genes", "Interferon gamma signaling", "Interleukin-4 and Interleukin-13 signaling", "Signaling by Interleukins", "Immune System", "Innate Immune System", "Antigen processing: Ub, ATP-independent proteasomal degradation", "Synthesis of Prostaglandins (PG) and Thromboxanes (TX)", "Modulation of host responses by IFN-stimulated genes", "Cell-Cell communication", "VEGFA-VEGFR2 Pathway")
+
+
+Rctome_interesting <- fgsea_NIvsINF_reactome |>  filter(pathway %in% interesting_pathways)
+
+Rctome_interesting_all <- fgsea_NIvsINF_reactome |>  filter(pathway %in% interesting_pathways_all)
+```
+
+### 3.2 FGSEA Barplot
+
+```{r}
+library(ggplot2)
+library(scales)
+
+plot_fgsea_bar <- function(data, plot_title, y_label) {
+  ggplot(data, aes(x = NES, y = reorder(pathway, NES))) +
+    geom_col(aes(fill = -log10(padj))) +
+    scale_fill_gradientn(
+      colors = c("#2166ac", "#67a9cf", "#d1e5f0", "#ef8a62", "#b2182b", "#b2182b"),
+      values = rescale(c(1.3, 2, 5, 10, 13)),  # -log10(padj)
+      limits = c(0.05, 15),
+      breaks = c(1, 3, 5, 10, 15),
+      labels = c("0.05", "0.01", "1e-5", "1e-10", "1e-13"),
+      name = "padj"
+    ) +
+    labs(
+      title = plot_title,
+      x = "NES", y = y_label
+    ) +
+    theme_minimal() +
+    theme(
+      axis.title = element_text(size = 10, face = "bold"),
+      axis.text.y  = element_text(size = 10, face = "bold"),
+      plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+      legend.title = element_text(size = 9, face = "bold"),
+      legend.text = element_text(size = 8)
+    )
+}
+
+
+
+plot_fgsea_bar <- function(data, plot_title, y_label) {
+  library(ggplot2); library(scales)
+
+  # 1) Clamp zeros to a tiny positive value to avoid Inf
+  eps <- 1e-300
+  data$padj_clamped <- pmax(data$padj, eps)
+
+  # 2) Work on log scale
+  data$log_padj <- -log10(data$padj_clamped)
+
+  # Integer breaks on the log scale
+  rng <- range(data$log_padj[is.finite(data$log_padj)], na.rm = TRUE)
+  breaks <- seq(floor(rng[1]), ceiling(rng[2]), by = 1)
+
+  # Positions for gradientn must be in [0,1]
+  values <- rescale(breaks, to = c(0, 1), from = range(breaks))
+
+  ggplot(data, aes(x = NES, y = reorder(pathway, NES))) +
+    geom_col(aes(fill = log_padj)) +
+    scale_fill_gradientn(
+      colors = c("#2166ac", "#67a9cf", "#d1e5f0", "#ef8a62", "#b2182b", "#67001f"),
+      values = values,
+      breaks = breaks,
+      labels = label_scientific()(10^(-breaks)),  # 1e-2, 1e-3, ...
+      name   = "padj"
+    ) +
+    labs(title = plot_title, x = "NES", y = y_label) +
+    theme_minimal(base_size = 10) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          axis.text.y  = element_text(size = 10, face = "bold", family = "Arial"),
+          legend.title = element_text(face = "bold"),
+          plot.title.position = "plot")
+}
+```
+
+```{r}
+
+
+
+
+fgsea_plot_topbot10 <- plot_fgsea_bar(topbot_KEGG, plot_title = "Top 10 Most Up/Downregulated KEGG Pathways in Inflamed vs Healthy", y_label = "Pathway (KEGG)")
+fgsea_plot_topbot10
+fgsea_plot_top20 <- plot_fgsea_bar(topabs_KEGG, plot_title = "Top 20 most disregulated KEGG pathways in Inflamed vs Healthy (log2FC)", y_label = "Pathway (KEGG)")
+fgsea_plot_top20
+
+
+
+fgsea_plot_topbot10_Rctome <- plot_fgsea_bar(topbot_Rctome, plot_title = "Top 10 Most Up/Downregulated Reactome Pathways in Inflamed vs Healthy", y_label = "Pathway (Reactome)")
+fgsea_plot_topbot10_Rctome
+fgsea_plot_top20_Rctome <- plot_fgsea_bar(topabs_Rctome, plot_title = "Top 20 most disregulated Reactome pathways in Inflamed vs Healthy", y_label = "Pathway (Reactome)")
+fgsea_plot_top20_Rctome
+fgsea_plot_bot20_Rctome <- plot_fgsea_bar(bot20_Rctome, plot_title = "Top 20 most Downregulated Reactome pathways in Inflamed vs Healthy", y_label = "Pathway (Reactome)")
+fgsea_plot_bot20_Rctome
+
+
+fgsea_plot_bot10_Rctome <- plot_fgsea_bar(bot10_Rctome, plot_title = "Top 10 most Downregulated Reactome pathways in Inflamed vs Healthy", y_label = "Pathway (Reactome)")
+fgsea_plot_bot10_Rctome
+
+
+fgsea_interesting_pathways <- plot_fgsea_bar(Rctome_interesting, plot_title = "IBD-related Up-regulated Reactome Pathways in Inflamed vs Healthy", y_label = "Pathway (Reactome)")
+fgsea_interesting_pathways
+
+fgsea_interesting_pathways_all <- plot_fgsea_bar(Rctome_interesting_all, plot_title = "IBD-related Reactome Pathways in Inflamed vs Healthy", y_label = "Pathway (Reactome)")
+fgsea_interesting_pathways_all
+```
+
+```{r, warning=FALSE}
+
+
+
+ggsave(plot = fgsea_plot_top20, filename = file.path(base_dir, "fgsea/fgsea_barplot_top20abs_KEGG.png"), width = 14, height = 10, dpi = 400, bg = "white")
+ggsave(plot = fgsea_plot_topbot10, filename = file.path(base_dir, "fgsea/fgsea_barplot_topbot10_KEGG.png"), width = 14, height = 10, dpi = 400, bg = "white" )
+
+
+ggsave(plot = fgsea_plot_top20_Rctome, filename = file.path(base_dir, "fgsea/fgsea_barplot_top20abs_rctome.png"), width = 14, height = 10, dpi = 400, bg = "white" )
+ggsave(plot = fgsea_plot_topbot10_Rctome, filename = file.path(base_dir, "fgsea/fgsea_barplot_topbot10_rctome.png"), width = 14, height = 10, dpi = 400, bg = "white" )
+ggsave(plot = fgsea_plot_bot20_Rctome, filename = file.path(base_dir, "fgsea/fgsea_barplot_bot20abs_rctome.png"), width = 14, height = 10, dpi = 400, bg = "white" )
+
+ggsave(plot = fgsea_plot_bot10_Rctome, filename = file.path(base_dir, "fgsea/fgsea_barplot_bot10abs_rctome.png"), width = 14, height = 10, dpi = 400, bg = "white" )
+
+
+ggsave(plot = fgsea_interesting_pathways, filename = file.path(base_dir, "fgsea/fgsea_barplot_IBD_rctome_reshaped.png"), width = 14, height = 10, dpi = 400, bg = "white" )
+
+
+ggsave(plot = fgsea_interesting_pathways_all, filename = file.path(base_dir, "fgsea/fgsea_barplot_IBD_rctome_reshaped_all.png"), width = 14, height = 10, dpi = 400, bg = "white" )
+
+
+```
+
+Almost all the interesting (Potentially related to IBD/Inflammation) pathways spotted in the analysis are downregulated in Inflamed samples. Some of them are:
+
+**ERK/MAPK targets & MAPK pathways:** Wound healing, angiogenesis, cross-talk with immune cells
+
+**VEGFA/VEGFR2:** May suggest vascular inestability, which added to the overexpression of CD44 and VCAM-1 would suggest an enhanced migration of immune cells from the blood to the tissue, in which pericytes would facilitate the process by dismantling the endothelium junctions and secrete adhesion molecules (like CD44 and VCAM-1).
+
+**Cell-Cell communication**: Important, can potentially reduce anti-inflammatory signaling pathways to inmune cells, fibroblasts... Will be further explored
+
+**Platelet Homeostasis and sensitization:** Lower platelet adhesion can lead to coagulation imbalances or vascular leakiness (IBD features)
+
+**Inositol phosphate metabolism:** Intracelular calcium signaling and cell motility, which can affect pericyte contraction and vascular tone
+
+**FGFR pathways**: INvolved in angiogenesis, wound repair and epithelial homeostasis
+
+**PI3K**: Mediate survival signal and anti-inflammatory responses
+
+## 
