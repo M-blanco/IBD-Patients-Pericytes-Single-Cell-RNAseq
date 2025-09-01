@@ -1,0 +1,570 @@
+---
+title: "pericytes_Cells"
+author: "Miguel Blanco"
+format: html
+editor: visual
+---
+
+```{r}
+suppressPackageStartupMessages({
+library(SeuratData)
+library(tidyverse)
+library(Seurat)
+library(ggplot2)
+library(ggrepel)
+library(tibble)
+library(DESeq2)
+library(patchwork)
+library(clustree)
+})
+
+```
+
+```{r}
+obj <- readRDS(file = "/home/projects/dtu_00062/people/camlem/data/04_integration/batch/Harmony/2025_01_06_Harmony_integrated_object.rds")
+```
+
+```{r}
+DefaultAssay(obj) <- "RNA"
+
+Idents(obj) <- "cluster_full"
+
+umap_full <- "Harmony_umap_full"
+
+celltype_anno <- data.frame(
+
+  cluster_full = seq(0, 37, 1),
+
+  author_cell_type = c("stromal 1 fibroblasts", "blood endothelial cells", "CD4 T cells",
+
+                       "stromal 3 fibroblasts", "monocytes/macrophages", "glial cells",
+
+                       "stromal 4 fibroblasts", "monocytes/macrophages", "plasma cells",
+
+                       "B cells", "blood endothelial cells", "cDCs", "stromal 2 fibroblasts",
+
+                       "pericytes", "CD8 T cells/NK cells", "lymphatic endothelial cells",
+
+                       "stromal 1 fibroblasts", "proliferating cells", "mast cells",
+
+                       "PDCs", "ILCs", "monocytes/macrophages", "cDCs", "plasma cells",
+
+                       "monocytes/macrophages", "enterocytes", "smooth muscle cells",
+
+                       "cDCs", "stromal 4 fibroblasts", "blood endothelial cells", "glial cells",
+
+                       "stromal 4 fibroblasts", "mast cells", "unknown", "proliferating cells",
+
+                       "lymphocytes ambiguous", "blood endothelial cells", "unknown"))
+
+new.identities <- setNames(celltype_anno$author_cell_type, celltype_anno$cluster_full)
+
+obj <- RenameIdents(obj, new.identities)
+
+pericytes <- subset(obj, idents = "pericytes")
+saveRDS(pericytes, file = "pericytes.rds")
+```
+
+```{r}
+pericytes <- readRDS(file = "../pericytes")
+```
+
+## Restructure Layers
+
+```{r}
+pericytes <- JoinLayers(pericytes)
+```
+
+```{r}
+pericytes@meta.data |> 
+  dplyr::count(Disease)
+
+pericytes <- subset(pericytes, subset = Disease == "CRC" | Disease == "CD")
+```
+
+```{r}
+pericytes@meta.data <- pericytes@meta.data |> 
+  mutate(study_case = case_when(
+    Sample_Condition == "Healthy_CRC" ~ "Healthy_CRC",
+    Sample_Condition == "Non_Inflamed" | Sample_Condition == "Non_inflamed" ~ "Non_inflamed_CD",
+    TRUE ~ "inflamed_CD"
+  ))
+```
+
+```{r}
+pericytes@meta.data |> 
+  dplyr::count(study_case)
+```
+
+```{r}
+pericytes@reductions <- list()
+```
+
+## 1. Exclude Patients
+
+### 1.1 Exclude patients with a low number of cells
+
+```{r}
+pericytes@meta.data <- pericytes@meta.data |> 
+  mutate(Patient_studycase = paste0(Patient, "_", study_case))
+```
+
+```{r}
+t <- table(pericytes$Patient_studycase, pericytes$study_case)
+
+t
+```
+
+Eliminate all samples (conditions) with less than 40 cells
+
+```{r}
+patients_studycase_tokeep <- rownames(t[rowSums(t) > 40, ])
+```
+
+```{r}
+pericytes <- subset(pericytes, subset = Patient_studycase %in% patients_studycase_tokeep)
+```
+
+```{r}
+table(pericytes$Patient_studycase, pericytes$study_case)
+```
+
+### Split and Run Seurat workflow
+
+```{r}
+pericytes
+```
+
+```{r}
+pericytes[["RNA"]] <- split(pericytes[["RNA"]], f = pericytes$Sequencing_Batch)
+```
+
+```{r}
+pericytes <- NormalizeData(pericytes, normalization.method = "LogNormalize", scale.factor = 10000, verbose = FALSE, layer = "counts*")
+pericytes <- FindVariableFeatures(pericytes, selection.method = "vst", layer = "data*")
+pericytes <- ScaleData(pericytes, verbose = F)
+pericytes <- RunPCA(pericytes)
+```
+
+```{r}
+PCApercentVarianceExplained <- function(Seurat_object)
+  {
+    std_devpc <- Seurat_object@reductions$pca@stdev
+    pc_explainedvariance <- (std_devpc^2) / sum(std_devpc^2) * 100
+    #print(sum(pc_explainedvariance))
+    print(cumsum(pc_explainedvariance))
+}
+
+PCApercentVarianceExplained(pericytes)
+```
+
+```{r}
+pericytes <- FindNeighbors(pericytes, dims = 1:25, reduction = "pca")
+pericytes <- FindClusters(pericytes, resolution = 0.25, cluster.name = "unintegrated_clusters")
+
+pericytes <- RunUMAP(pericytes, reduction = "pca", dims = 1:25, reduction.name = "unintegrated_UMAP")
+
+UMAP_unintegrated <- DimPlot(pericytes, reduction = "unintegrated_UMAP", group.by = "Sequencing_Batch")
+UMAP_unintegrated
+DimPlot(pericytes, reduction = "unintegrated_UMAP", group.by = "unintegrated_clusters")
+
+ggsave(filename= "Pericytes_all/UMAP_unintegrated_batch.png", plot = UMAP_unintegrated, width = 10, height = 8, dpi = 200)
+```
+
+```{r}
+pericytes <- IntegrateLayers(pericytes, method = HarmonyIntegration, 
+                orig.reduction = "pca", 
+                new.reduction = "harmony.integrated",
+                group.by = "Sequencing_Batch",
+                verbose = FALSE)
+
+pericytes <- FindNeighbors(pericytes, reduction = "harmony.integrated", dims = 1:25, verbose = FALSE)
+
+pericytes <- RunUMAP(pericytes, reduction = "harmony.integrated", dims = 1:25, reduction.name = "harmony_UMAP", verbose = F)
+
+p1 <- DimPlot(pericytes, reduction = "unintegrated_UMAP",  group.by = "Sequencing_Batch")
+p2 <- DimPlot(pericytes, reduction = "harmony_UMAP",  group.by = "Sequencing_Batch")
+
+p1
+p2
+
+ggsave(filename= "Pericytes_all/UMAP_integrated_batch.png", plot = p2, width = 10, height = 8, dpi = 200)
+```
+
+```{r}
+dim(Embeddings(pericytes, reduction = "pca"))
+
+pc_scores <- Embeddings(pericytes, "pca")[, 1:2]   # first 2 PCs
+pc_scores <- as.data.frame(pc_scores)
+pc_scores$patient <- pericytes$Patient_studycase
+
+
+patient_coords <- pc_scores |> 
+  group_by(patient) |> 
+  summarise(PC1 = mean(PC_1),
+            PC2 = mean(PC_2),
+            .groups = "drop") |> 
+  mutate(condition = case_when(
+    grepl("^P.*inflamed_CD", patient) ~ "P_Inflamed",
+    grepl("^P.*Healthy_CRC", patient) ~ "P_Healthy",
+    grepl("^H.*Non_inflamed_CD", patient) ~ "H_NonInflamed",
+    grepl("^H.*Healthy_CRC", patient) ~ "H_Healthy",
+    TRUE ~ "H_Inflammed"))
+
+
+
+
+PCAplot <- ggplot(patient_coords, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 4) +
+  geom_text(aes(label = patient), vjust = -1, size = 3, show.legend = FALSE) +
+  theme_classic() +
+  labs(x = "PC1 (19.12%)", y = "PC2 (9.44%)",
+       title = "Pericytes PCA") +
+  scale_color_manual(
+    values = c(
+      "P_Inflamed"   = "#d73027",  # strong red
+      "H_Inflammed"  = "#fc8d59",  # softer orange-red
+      "H_NonInflamed"= "#4575b4",  # blue
+      "P_Healthy"    = "#1a9850",  # green
+      "H_Healthy"    = "#66bd63"   # lighter green
+    )) +
+  theme(plot.title = element_text(face = "bold",
+                                  hjust = 0.5))
+
+
+PCAplot
+
+ggsave(PCAplot, file = "Pericytes_all//PCAplot.png", width = 12, height = 10, dpi = 400, bg = "white")
+```
+
+```{r}
+pca_coords <- Embeddings(pericytes, reduction = "harmony.integrated")[, 1:10]
+
+
+pca_coords
+```
+
+### Mahalanobis Outlier Test
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(MASS)         # cov.rob
+library(stats)
+
+mahal_outliers <- function(seu, 
+                           reduction = "pca", 
+                           group_vars = c("Patient","Condition"),  # or "Patient" only
+                           var_target = 0.80,                      # 75–80% variance
+                           robust = TRUE) {
+
+  # 1) get PC embeddings & variance explained
+  emb <- Embeddings(seu, reduction)
+  stv <- seu@reductions[[reduction]]@stdev
+  var_exp <- (stv^2) / sum(stv^2)
+  k <- which(cumsum(var_exp) >= var_target)[1]
+  if (is.na(k)) k <- ncol(emb)
+  emb <- emb[, 1:k, drop = FALSE]
+  message(sprintf("Using first %d %s PCs covering %.1f%% variance",
+                  k, reduction, 100*sum(var_exp[1:k])))
+
+  # 2) build per-cell df with grouping variables
+  meta <- as.data.frame(seu@meta.data)
+  stopifnot(all(group_vars %in% colnames(meta)))
+  df <- cbind(as.data.frame(emb), meta[, group_vars, drop = FALSE])
+  colnames(df)[1:k] <- paste0("PC", 1:k)
+
+  # 3) collapse to centroids per group
+  df_cent <- df |>
+    group_by(across(all_of(group_vars))) |>
+    summarise(across(starts_with("PC"), ~ mean(.x, na.rm = TRUE)),
+              .groups = "drop")
+
+  X <- as.matrix(df_cent |> dplyr::select(starts_with("PC")))
+
+  # 4) center & covariance (robust or classical)
+  if (robust) {
+    cr <- cov.rob(X, method = "mcd")  # robust center & covariance
+    center <- cr$center
+    Sigma  <- cr$cov
+  } else {
+    center <- colMeans(X, na.rm = TRUE)
+    Sigma  <- cov(X, use = "pairwise.complete.obs")
+  }
+
+  # 5) Mahalanobis distances and p-values
+  d2 <- mahalanobis(X, center, Sigma)           # squared distance
+  p  <- pchisq(d2, df = ncol(X), lower.tail = FALSE)
+
+  out <- df_cent |>
+    mutate(Mahalanobis2 = as.numeric(d2),
+           pval = as.numeric(p),
+           fdr  = p.adjust(p, method = "BH"))
+
+  # 6) quick plot
+  gg <- ggplot(out, aes(Mahalanobis2, -log10(pval), label = paste(!!!syms(group_vars)))) +
+  geom_point() +
+  geom_text_repel(size = 3, max.overlaps = 20) +
+  geom_hline(yintercept = -log10(0.05), linetype = 2, color = "grey50") +
+  theme_classic() +
+  labs(title = "Mahalanobis outlier test in PC space",
+       subtitle = sprintf("Groups: %s | k=%d PCs (%.1f%% var)",
+                          paste(group_vars, collapse = "×"),
+                          k, 100*sum(var_exp[1:k])),
+       x = expression(D^2), y = expression(-log[10](p)))
+
+  list(table = out, plot = gg, pcs_used = k)
+}
+
+# EXAMPLES
+# (A) per Patient only
+res_pat  <- mahal_outliers(pericytes, reduction = "pca",
+                           group_vars = "Patient", var_target = 0.80, robust = TRUE)
+res_pat$plot
+dplyr::arrange(res_pat$table, fdr) |> head()
+
+# (B) per Patient × Condition (paired check)
+res_pair <- mahal_outliers(pericytes, reduction = "pca",
+                           group_vars = c("Patient","study_case"),
+                           var_target = 0.80, robust = TRUE)
+res_pair$plot
+
+
+
+view(res_pat$table)
+view(res_pair$table)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(MASS)   # cov.rob
+library(rlang)
+
+mahal_within_condition <- function(
+  seu, reduction = "pca",
+  patient_var   = "Patient",
+  condition_var = "study_case",
+  keep_levels   = NULL,
+  var_target = 0.80, robust = TRUE,
+  label_points = TRUE
+){
+  # PCs + variance
+  emb <- Embeddings(seu, reduction)
+  stv <- seu@reductions[[reduction]]@stdev
+  varexp <- (stv^2) / sum(stv^2)
+  k <- which(cumsum(varexp) >= var_target)[1]; if (is.na(k)) k <- ncol(emb)
+  emb <- emb[, 1:k, drop = FALSE]
+  colnames(emb) <- paste0("PC", 1:k)
+
+  meta <- as.data.frame(seu@meta.data)
+  stopifnot(all(c(patient_var, condition_var) %in% names(meta)))
+
+  # keep only requested condition levels (optional)
+  if (!is.null(keep_levels)) {
+    meta <- meta[meta[[condition_var]] %in% keep_levels, , drop = FALSE]
+    emb  <- emb[rownames(meta), , drop = FALSE]
+  }
+
+  df <- cbind(as.data.frame(emb), meta[, c(patient_var, condition_var), drop = FALSE])
+
+  # centroids per Patient×Condition
+  cent <- df %>%
+    group_by(.data[[condition_var]], .data[[patient_var]]) %>%
+    summarise(across(starts_with("PC"), ~mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+    rename(condition = !!sym(condition_var),
+           patient   = !!sym(patient_var))
+
+  pc_mat <- as.matrix(dplyr::select(cent, starts_with("PC")))
+
+  # MD per condition (center/cov estimated within each condition)
+  res <- lapply(split(seq_len(nrow(cent)), cent$condition), function(idx){
+    X <- pc_mat[idx, , drop = FALSE]
+    if (nrow(X) < 3) return(
+      data.frame(idx = idx, D2 = NA_real_, pval = NA_real_)
+    )
+    if (robust) {
+      cr <- cov.rob(X, method = "mcd")
+      D2 <- mahalanobis(X, center = cr$center, cov = cr$cov)
+    } else {
+      D2 <- mahalanobis(X, center = colMeans(X), cov = cov(X))
+    }
+    p  <- pchisq(D2, df = ncol(X), lower.tail = FALSE)
+    data.frame(idx = idx, D2 = as.numeric(D2), pval = as.numeric(p))
+  })
+  res <- do.call(rbind, res)[order(res$idx), ]
+  out <- cent %>% mutate(Mahalanobis2 = res$D2,
+                         pval = res$pval,
+                         fdr  = p.adjust(pval, "BH"))
+
+  # volcano-style MD plot with labels
+  gg <- ggplot(out, aes(Mahalanobis2, -log10(pval), color = condition, label = patient)) +
+    geom_point(size = 2.8) +
+    {if (label_points) ggrepel::geom_text_repel(size = 2.8, max.overlaps = 50) else NULL} +
+    geom_hline(yintercept = -log10(0.05), linetype = 2, color = "grey50") +
+    theme_classic() +
+    labs(title = "Mahalanobis outlier test (within condition)",
+         subtitle = sprintf("k=%d PCs (%.1f%% var); robust=%s",
+                            k, 100*sum(varexp[1:k]), robust),
+         x = expression(D^2), y = expression(-log[10](p)))
+
+  list(table = out, plot = gg, pcs_used = k)
+}
+
+
+res <- mahal_within_condition(
+  pericytes, reduction = "pca",
+  patient_var = "Patient",
+  condition_var = "study_case",
+  keep_levels = c("Healthy_CRC","inflamed_CD"),
+  var_target = 0.80, robust = TRUE
+)
+
+res$plot
+head(arrange(res$table, fdr))
+```
+
+```{r}
+
+Assays(pericytes)
+
+get_patient_mds <- function(seurat_obj,
+                            reduction = "pca",
+                            n_components = 10,
+                            group_var = "Patient_Inflammation") {
+  # 1. Extract first N PCs
+  pca_coords <- Embeddings(seurat_obj, reduction = reduction)[, 1:n_components]
+  
+  # 2. Build dataframe with grouping variable
+  pca_df <- data.frame(pca_coords,
+                       group = seurat_obj[[group_var]][, 1])
+  
+  # 3. Aggregate (centroids) across groups
+  centroids <- pca_df |>
+    group_by(group) |>
+    summarise(across(starts_with("harmony"), mean), .groups = "drop")
+  
+  # 4. Distance matrix
+  dist_matrix <- dist(centroids |> dplyr::select(starts_with("harmony")))
+  
+  # 5. Classical MDS
+  mds_coords <- cmdscale(dist_matrix, k = 2)
+  
+  # 6. Format output
+  mds_df <- data.frame(mds_coords,
+                       group = centroids$group)
+  colnames(mds_df)[1:2] <- c("MDS1", "MDS2")
+  
+  mds_df$Color <- case_when(
+  grepl("^P.*inflamed_CD", mds_df$group) ~ "P_Inflamed",
+  grepl("^P.*Healthy_CRC", mds_df$group) ~ "P_Healthy",
+  grepl("^H.*Non_inflamed_CD", mds_df$group) ~ "H_NonInflamed",
+  grepl("^H.*Healthy_CRC", mds_df$group) ~ "H_Healthy",
+  TRUE ~ "H_Inflammed")
+  
+  mds <- ggplot(mds_df, aes(x = MDS1, y = MDS2, label = group, color = Color)) +
+  geom_point(size = 4) +
+  geom_text(vjust = -0.8, size = 3, show.legend = FALSE) +
+  theme_minimal() +
+  labs(title = "MDS of Patient PCA Centroids",
+       subtitle = "Based on average PC1–PC10 profiles") +
+  scale_color_manual(
+    values = c(
+      "P_Inflamed"   = "#d73027",  # strong red
+      "H_Inflammed"  = "#fc8d59",  # softer orange-red
+      "H_NonInflamed"= "#4575b4",  # blue
+      "P_Healthy"    = "#1a9850",  # green
+      "H_Healthy"    = "#66bd63"   # lighter green
+    )
+  )
+  
+  return(mds)
+}
+
+
+
+
+mds_all <- get_patient_mds(pericytes, reduction = "harmony.integrated", n_components = 10,
+                          group_var = "Patient_studycase")
+
+mds_all
+
+
+
+```
+
+```{r}
+ggsave(mds_all, filename = "Pericytes_all/mds_Harmony.png", width = 12, height = 10, dpi = 400, bg = "white")
+```
+
+```{r}
+unique(pericytes$Patient_studycase)
+```
+
+Looking at the MDS plot, we are going to eliminate patients:\
+\
+P: They profiles cluster more according to the "P" status (Different protocol) than to the inflammed/Non inflamed condition. Additionally, this patients had a status of "Low" Inflamation, so they won't be included as inflamed samples
+
+HH01 shows a unique expression profile, specially the inflamed status
+
+HH77 and HH78 group more according to patient than to the condition, so they will be discarded for the "general" filtering, but they will be included in the Inflamed Vs Non Inflamed comparison where we can introduce the patient as a covariate.
+
+## General Filter
+
+```{r}
+saveRDS(pericytes, file = "pericytes_general.rds")
+```
+
+```{r}
+patients_studycase_tokeep_general <- patients_studycase_tokeep[ !grepl("^P|HH01|HH77|HH78", patients_studycase_tokeep)]
+pericytes_general <- subset(pericytes, subset = Patient_studycase %in% patients_studycase_tokeep_general)
+
+patients_studycase_tokeep_IvsNI <- patients_studycase_tokeep[ !grepl("^P|Healthy|HH78", patients_studycase_tokeep)]
+pericytes_IvsNI <- subset(pericytes, subset = Patient_studycase %in% patients_studycase_tokeep_IvsNI)
+
+
+patients_studycase_tokeep_HvsInf <- patients_studycase_tokeep_general[ !grepl("*_Non_inflamed_CD", patients_studycase_tokeep_general)]
+pericytes_HealthyvsInf <- subset(pericytes, subset = Patient_studycase %in% patients_studycase_tokeep_HvsInf)
+
+
+```
+
+```{r}
+mds_general <- get_patient_mds(pericytes_general, reduction = "harmony.integrated", n_components = 10,
+                          group_var = "Patient_studycase")
+
+
+
+
+mds_IvsNI <- get_patient_mds(pericytes_IvsNI, reduction = "harmony.integrated", n_components = 10,
+                          group_var = "Patient_studycase")
+
+mds_IvsHealthy <- get_patient_mds(pericytes_HealthyvsInf, reduction = "harmony.integrated", n_components = 10,
+                          group_var = "Patient_studycase")
+
+
+
+
+mds_general
+mds_IvsNI
+mds_IvsHealthy
+
+
+
+
+```
+
+```{r}
+saveRDS(pericytes_IvsNI, file = "IvsNI/pericytesIvsNI")
+saveRDS(pericytes_general, file = "HealthyVs/Pericytes_healthyVs.rds")
+
+pericytes_general
+```
+
+```{r}
+
+```
+
+```{r}
+pericytes
+```
